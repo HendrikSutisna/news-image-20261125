@@ -4,8 +4,9 @@ A newspaper front page summing up Wednesday 25 November 2026: Saudi-led
 strikes on Hodeidah port as the Yemen war widens, the Solomon Islands
 signing a historic security treaty with Australia, all hostages freed in
 the Cartagena supermarket siege, Bangladesh raising garment workers' pay
-by 36%, and three dead with 23 miners still trapped in a flooded gold
-mine in Bogor, Indonesia.
+by 36%, and nine dead with 17 miners still trapped in a flooded gold
+mine in Bogor, Indonesia. Also: North Korea expels the Swiss envoy,
+Pakistan's first astronaut docks at Tiangong, and the Nikkei falls 2.8%.
 
 ## make.fun
 

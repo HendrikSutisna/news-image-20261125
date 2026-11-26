@@ -1,252 +1,339 @@
 #!/usr/bin/env python3
-"""Build the WORLD NEWS front page for Wednesday 25 November 2026.
+"""Draw the WORLD NEWS front page for Wednesday 25 November 2026, v2.
 
-Fresh artwork for the make.fun news-image-20261125 bounty. All text is drawn
-with real DejaVu fonts (PIL) so every letter renders cleanly; all pictures are
-simple flat pictograms drawn with PIL shapes. Output: 1024x1024 PNG.
+Self-contained Pillow renderer: every glyph, rule and picture on the page
+is drawn from the story data below with plain drawing primitives, so the
+output is byte-for-byte deterministic. Usage:
+
+    python3 dev/build.py [output.png]
+
+Default output is entry/entry.png next to the repository root.
 """
+
+from __future__ import annotations
+
+import hashlib
 import os
+import sys
+
 from PIL import Image, ImageDraw, ImageFont
 
 W, H = 1024, 1024
-PAPER = (247, 242, 231)      # cream newsprint
-INK = (20, 20, 20)
-RED = (176, 0, 32)
-BLUE = (31, 78, 121)
-GREEN = (30, 107, 52)
-NAVY = (31, 42, 68)
-GOLD = (255, 201, 60)
-FONT_DIR = "/usr/share/fonts/truetype/dejavu"
+
+PAPER = (246, 241, 227)
+INK = (18, 18, 18)
+RED = (193, 39, 45)
+NAVY = (28, 43, 74)
+NAVY_DEEP = (23, 35, 60)
+SEA_DARK = (18, 32, 56)
+GOLD = (245, 179, 1)
+GREEN = (30, 125, 50)
+BLUE = (21, 101, 192)
+SEA = (52, 96, 140)
+MUTED = (158, 175, 208)
+WHITE = (255, 255, 255)
+ICON_BG = (238, 232, 214)
+
+SERIF = "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf"
+SERIF_BOLD = "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf"
+SANS = "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
+SANS_BOLD = "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
+MASTHEAD_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf"
+
+MASTHEAD = "WORLD NEWS"
+DATELINE = "WEDNESDAY 25 NOVEMBER 2026"
+
+LEAD = {
+    "kicker": "YEMEN",
+    "headline": "SAUDI JETS BOMB HODEIDAH PORT AS WAR WIDENS",
+    "summary": (
+        "Coalition strikes Houthi-held Hodeidah port and targets in Saada "
+        "and Amran; Houthis claim a hit on Ras Tanura refinery and threaten Jeddah."
+    ),
+}
+
+PANELS = [
+    {
+        "kicker": "PACIFIC",
+        "color": BLUE,
+        "headline": "SOLOMONS PICK AUSTRALIA IN HISTORIC TREATY",
+        "summary": (
+            "Albanese and Wale sign in Canberra; Solomons rule out any "
+            "foreign military base on their soil."
+        ),
+        "icon": "treaty",
+    },
+    {
+        "kicker": "COLOMBIA",
+        "color": RED,
+        "headline": "ALL HOSTAGES FREED IN CARTAGENA RAID",
+        "summary": (
+            "Troops storm supermarket after day-long siege; one gunman "
+            "killed, four detained."
+        ),
+        "icon": "store",
+    },
+    {
+        "kicker": "BANGLADESH",
+        "color": GREEN,
+        "headline": "GARMENT PAY UP 36% AFTER PROTESTS",
+        "summary": (
+            "Minimum wage rises to Tk17,000 a month from Tk12,500; board "
+            "votes 4-2 after weeks of strikes."
+        ),
+        "icon": "coins",
+    },
+    {
+        "kicker": "INDONESIA",
+        "color": BLUE,
+        "headline": "9 DEAD, 17 STILL TRAPPED IN FLOODED MINE",
+        "summary": (
+            "Rescuers pump water from 100m shaft at illegal gold mine in "
+            "Bogor; 11 miners escaped Monday."
+        ),
+        "icon": "mine",
+    },
+]
+
+STRIP = [
+    "North Korea expels Swiss envoy \u2014 48 hours to leave.",
+    "Pakistan's first astronaut docks at Tiangong aboard Shenzhou-24.",
+    "Nikkei falls 2.8% as AI doubts hit tech shares.",
+]
+
+FOOTER = "WORLD NEWS \u00b7 25 NOVEMBER 2026"
 
 
-def font(name, size):
-    return ImageFont.truetype(os.path.join(FONT_DIR, name), size)
+def load(path, size):
+    return ImageFont.truetype(path, size)
 
 
-SERIF_B = lambda s: font("DejaVuSerif-Bold.ttf", s)
-SANS_B = lambda s: font("DejaVuSans-Bold.ttf", s)
-SANS = lambda s: font("DejaVuSans.ttf", s)
-
-img = Image.new("RGB", (W, H), PAPER)
-d = ImageDraw.Draw(img)
+def text_w(draw, text, font):
+    return draw.textlength(text, font=font)
 
 
-def text_w(s, f):
-    return d.textlength(s, font=f)
-
-
-def wrap(s, f, max_w):
-    words, lines, cur = s.split(), [], ""
-    for w in words:
-        t = (cur + " " + w).strip()
-        if text_w(t, f) <= max_w:
-            cur = t
+def wrap(draw, text, font, max_w):
+    """Greedy word wrap; a single over-long word still goes on its own line."""
+    words = text.split()
+    lines, cur = [], ""
+    for word in words:
+        trial = word if not cur else cur + " " + word
+        if text_w(draw, trial, font) <= max_w or not cur:
+            cur = trial
         else:
             lines.append(cur)
-            cur = w
+            cur = word
     if cur:
         lines.append(cur)
     return lines
 
 
-def fit_lines(lines, f, max_w, start_size):
-    """Return (font, lines) with size lowered until every line fits."""
-    size = start_size
-    while size > 10:
-        ff = SANS_B(size) if f == "b" else SANS(size)
-        if all(text_w(ln, ff) <= max_w for ln in lines):
-            return ff, lines
+def fit_wrap(draw, text, path, size, max_w, max_lines, min_size=20):
+    """Largest size (stepping down by 2) whose wrap fits max_lines lines."""
+    while size >= min_size:
+        font = load(path, size)
+        lines = wrap(draw, text, font, max_w)
+        if len(lines) <= max_lines and all(
+            text_w(draw, line, font) <= max_w for line in lines
+        ):
+            return font, lines
         size -= 2
-    return SANS_B(10), lines
+    font = load(path, min_size)
+    return font, wrap(draw, text, font, max_w)
 
 
-def hline(y, color, width, x0=8, x1=1016):
-    d.rectangle([x0, y, x1, y + width - 1], fill=color)
+def tracked_width(draw, text, font, track):
+    total = sum(text_w(draw, ch, font) for ch in text)
+    return total + track * max(len(text) - 1, 0)
 
 
-# ---- outer frame ------------------------------------------------------------
-d.rectangle([0, 0, W - 1, H - 1], outline=INK, width=8)
+def draw_tracked(draw, cx, y, text, font, fill, track):
+    x = cx - tracked_width(draw, text, font, track) / 2
+    for ch in text:
+        draw.text((x, y), ch, font=font, fill=fill)
+        x += text_w(draw, ch, font) + track
 
-# ---- masthead ---------------------------------------------------------------
-d.rectangle([8, 8, 1016, 108], fill=INK)
-mast = SERIF_B(86)
-d.text((512, 58), "WORLD NEWS", font=mast, fill=(255, 255, 255), anchor="mm")
-hline(108, RED, 6)
 
-# ---- dateline ---------------------------------------------------------------
-date_f = SANS_B(27)
-date_s = "W E D N E S D A Y   2 5   N O V E M B E R   2 0 2 6"
-d.text((512, 136), date_s, font=date_f, fill=INK, anchor="mm")
-hline(158, INK, 3)
+# ---------------------------------------------------------------- icons
 
-# ---- lead panel -------------------------------------------------------------
-LY0, LY1 = 170, 392
-d.rectangle([8, LY0, 1016, LY1], outline=INK, width=2)
-hline(LY0, RED, 4)
-d.text((24, 182), "YEMEN", font=SANS_B(24), fill=RED)
-lead_head = ["SAUDI JETS BOMB HODEIDAH", "PORT AS WAR WIDENS"]
-lf, _ = fit_lines(lead_head, "b", 672, 46)
-y = 214
-for ln in lead_head:
-    d.text((24, y), ln, font=lf, fill=INK)
-    y += lf.size + 6
-lead_body = wrap(
-    "Coalition strikes Houthi-held Hodeidah port and targets in Saada "
-    "and Amran; Houthis threaten Jeddah.",
-    SANS(24), 672)
-by = 322
-for ln in lead_body:
-    d.text((24, by), ln, font=SANS(24), fill=INK)
-    by += 30
 
-# lead art: Hodeidah port under fire
-AX0, AY0, AX1, AY1 = 712, 180, 1000, 382
-d.rectangle([AX0, AY0, AX1, AY1], fill=NAVY)
-d.text((AX0 + 10, AY0 + 8), "HODEIDAH UNDER FIRE", font=SANS_B(19), fill=(255, 255, 255))
-# sea
-d.rectangle([AX0, AY1 - 42, AX1, AY1], fill=(38, 68, 110))
-for i, wx in enumerate(range(AX0 + 6, AX1 - 10, 26)):
-    d.arc([wx, AY1 - 30, wx + 22, AY1 - 12], 0, 180, fill=(150, 190, 230), width=3)
-# ship hull
-d.polygon([(AX0 + 22, AY1 - 88), (AX1 - 22, AY1 - 88), (AX1 - 48, AY1 - 42),
-           (AX0 + 48, AY1 - 42)], fill=(178, 44, 36))
-# containers
-d.rectangle([AX0 + 46, AY1 - 128, AX0 + 106, AY1 - 88], fill=(240, 200, 60))
-d.rectangle([AX0 + 112, AY1 - 118, AX0 + 168, AY1 - 88], fill=(90, 180, 110))
-d.rectangle([AX0 + 174, AY1 - 128, AX0 + 226, AY1 - 88], fill=(200, 200, 200))
-# funnel
-d.rectangle([AX0 + 232, AY1 - 138, AX0 + 258, AY1 - 88], fill=(120, 120, 120))
-# flames
-for cx, cy, r in [(AX0 + 76, AY1 - 140, 16), (AX0 + 140, AY1 - 132, 20),
-                  (AX0 + 205, AY1 - 142, 15)]:
-    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(255, 140, 0))
-    d.ellipse([cx - r // 2, cy - r // 2, cx + r // 2, cy + r // 2], fill=(255, 220, 80))
-# mine in the water
-mx, my = AX0 + 60, AY1 - 22
-d.ellipse([mx - 11, my - 11, mx + 11, my + 11], fill=INK)
-for ang in range(0, 360, 45):
-    import math
-    x1 = mx + 11 * math.cos(math.radians(ang))
-    y1 = my + 11 * math.sin(math.radians(ang))
-    x2 = mx + 18 * math.cos(math.radians(ang))
-    y2 = my + 18 * math.sin(math.radians(ang))
-    d.line([x1, y1, x2, y2], fill=INK, width=3)
+def icon_box(draw, px, py):
+    draw.rectangle([px, py, px + 64, py + 64], fill=ICON_BG, outline=INK, width=2)
 
-# ---- small panels -----------------------------------------------------------
-def fit_head(head_lines, max_widths, start_size):
-    """Headline font sized so each line fits its own max width.
 
-    Line 1 shares its row with the pictogram, so it gets the narrower
-    width; later lines get the full panel width.
-    """
-    size = start_size
-    while size > 10:
-        ff = SANS_B(size)
-        if all(text_w(ln, ff) <= mw for ln, mw in zip(head_lines, max_widths)):
-            return ff
+def icon_treaty(draw, px, py):
+    icon_box(draw, px, py)
+    draw.rectangle([px + 14, py + 10, px + 42, py + 52], fill=WHITE, outline=INK, width=2)
+    draw.polygon(
+        [(px + 42, py + 10), (px + 52, py + 20), (px + 42, py + 20)],
+        fill=(205, 205, 205),
+    )
+    for ly in (22, 30, 38):
+        draw.line([px + 19, py + ly, px + 37, py + ly], fill=(130, 130, 130), width=2)
+    draw.line([px + 12, py + 54, px + 48, py + 20], fill=BLUE, width=4)
+    draw.ellipse([px + 44, py + 44, px + 58, py + 58], fill=RED)
+
+
+def icon_store(draw, px, py):
+    icon_box(draw, px, py)
+    for i in range(5):
+        colour = RED if i % 2 == 0 else WHITE
+        draw.rectangle(
+            [px + 10 + i * 9, py + 12, px + 18 + i * 9, py + 24],
+            fill=colour,
+            outline=INK,
+        )
+    draw.rectangle([px + 12, py + 24, px + 52, py + 52], fill=(212, 212, 212), outline=INK, width=2)
+    draw.rectangle([px + 26, py + 34, px + 38, py + 52], fill=NAVY)
+    draw.ellipse([px + 46, py + 8, px + 58, py + 20], fill=GOLD, outline=INK)
+
+
+def icon_coins(draw, px, py):
+    icon_box(draw, px, py)
+    for cx, cy in ((px + 24, py + 44), (px + 38, py + 44), (px + 31, py + 30)):
+        draw.ellipse([cx - 10, cy - 8, cx + 10, cy + 8], fill=(232, 178, 32), outline=(150, 110, 10), width=2)
+        draw.text((cx - 3, cy - 7), "$", font=load(SANS_BOLD, 12), fill=(120, 80, 0))
+    draw.line([px + 46, py + 50, px + 56, py + 18], fill=GREEN, width=4)
+    draw.polygon([(px + 56, py + 12), (px + 50, py + 22), (px + 60, py + 22)], fill=GREEN)
+
+
+def icon_mine(draw, px, py):
+    icon_box(draw, px, py)
+    draw.pieslice([px + 14, py + 14, px + 50, py + 50], 180, 360, fill=(40, 40, 40))
+    draw.rectangle([px + 14, py + 32, px + 50, py + 50], fill=(40, 40, 40))
+    draw.arc([px + 24, py + 26, px + 40, py + 40], 180, 360, fill=GOLD, width=4)
+    draw.line([px + 20, py + 40, px + 44, py + 40], fill=GOLD, width=3)
+    for wx in (px + 10, px + 26, px + 42):
+        draw.arc([wx, py + 52, wx + 16, py + 60], 180, 360, fill=SEA, width=2)
+
+
+ICONS = {
+    "treaty": icon_treaty,
+    "store": icon_store,
+    "coins": icon_coins,
+    "mine": icon_mine,
+}
+
+
+def draw_ship(draw, x, y, w, h):
+    """Lead illustration: cargo ship under fire at Hodeidah port."""
+    draw.rectangle([x, y, x + w, y + h], fill=NAVY)
+    draw.text((x + 14, y + 10), "HODEIDAH UNDER FIRE", font=load(SANS_BOLD, 20), fill=WHITE)
+    draw.rectangle([x + 36, y + 104, x + 100, y + 150], fill=(232, 178, 32))
+    draw.rectangle([x + 112, y + 96, x + 176, y + 150], fill=(46, 160, 90))
+    draw.rectangle([x + 188, y + 104, x + 252, y + 150], fill=(168, 172, 176))
+    draw.rectangle([x + 264, y + 112, x + 304, y + 150], fill=(120, 124, 128))
+    for cx, cy in ((x + 68, y + 88), (x + 144, y + 80), (x + 220, y + 88)):
+        draw.ellipse([cx - 16, cy - 16, cx + 16, cy + 16], fill=(240, 120, 20))
+        draw.ellipse([cx - 8, cy - 8, cx + 8, cy + 8], fill=(250, 210, 60))
+    draw.polygon(
+        [(x + 16, y + 150), (x + 320, y + 150), (x + 292, y + 196), (x + 44, y + 196)],
+        fill=(198, 52, 40),
+    )
+    draw.rectangle([x, y + 196, x + w, y + h], fill=SEA_DARK)
+    for wx in range(x + 8, x + w - 24, 28):
+        draw.arc([wx, y + 202, wx + 24, y + 212], 180, 360, fill=SEA, width=2)
+    mx, my = x + 44, y + 200
+    for dx, dy in ((-9, -9), (0, -12), (9, -9), (-12, 0), (12, 0), (-9, 9), (9, 9)):
+        draw.line([mx, my, mx + dx, my + dy], fill=INK, width=2)
+    draw.ellipse([mx - 7, my - 7, mx + 7, my + 7], fill=INK)
+
+
+# ---------------------------------------------------------------- layout
+
+
+def draw_masthead(draw):
+    draw.rectangle([0, 0, W, 104], fill=INK)
+    size = 96
+    while size > 60:
+        font = load(MASTHEAD_FONT, size)
+        if text_w(draw, MASTHEAD, font) <= 940:
+            break
         size -= 2
-    return SANS_B(10)
+    font = load(MASTHEAD_FONT, size)
+    tw = text_w(draw, MASTHEAD, font)
+    draw.text(((W - tw) / 2, (104 - size) / 2 - 4), MASTHEAD, font=font, fill=WHITE)
+    draw.rectangle([0, 104, W, 110], fill=RED)
+    draw.line([0, 112, W, 112], fill=INK, width=2)
+    draw_tracked(draw, W / 2, 118, DATELINE, load(SANS_BOLD, 27), INK, 12)
+    draw.line([0, 154, W, 154], fill=INK, width=2)
+    draw.rectangle([0, 156, W, 161], fill=RED)
 
 
-def small_panel(x0, x1, y0, y1, rule_color, kicker, head_lines, body, icon):
-    d.rectangle([x0, y0, x1, y1], outline=INK, width=2)
-    hline(y0, rule_color, 4, x0, x1)
-    d.text((x0 + 16, y0 + 14), kicker, font=SANS_B(22), fill=rule_color)
-    full_w = x1 - x0 - 32
-    widths = [full_w - 78] + [full_w] * (len(head_lines) - 1)
-    hf = fit_head(head_lines, widths, 34)
-    y = y0 + 46
-    for ln in head_lines:
-        d.text((x0 + 16, y), ln, font=hf, fill=INK)
-        y += hf.size + 4
-    bf = SANS(21)
-    for ln in wrap(body, bf, full_w):
-        d.text((x0 + 16, y), ln, font=bf, fill=INK)
-        y += 27
-    icon(x1 - 78, y0 + 12)
+def draw_lead(draw, x, y, w, h):
+    draw.text((x + 24, y + 14), LEAD["kicker"], font=load(SANS_BOLD, 24), fill=RED)
+    head_f, head_lines = fit_wrap(draw, LEAD["headline"], SERIF_BOLD, 46, 624, 2, min_size=36)
+    hy = y + 48
+    for line in head_lines:
+        draw.text((x + 24, hy), line, font=head_f, fill=INK)
+        hy += head_f.size + 6
+    sum_f = load(SANS, 21)
+    sy = hy + 8
+    for line in wrap(draw, LEAD["summary"], sum_f, 624)[:3]:
+        draw.text((x + 24, sy), line, font=sum_f, fill=INK)
+        sy += 27
+    draw_ship(draw, x + 664, y + 14, 336, 216)
 
 
-def icon_treaty(ix, iy):
-    d.rectangle([ix, iy, ix + 62, iy + 62], outline=INK, width=2, fill=(239, 232, 216))
-    d.rectangle([ix + 12, iy + 10, ix + 50, iy + 46], fill=(255, 255, 255), outline=INK)
-    for j, yy in enumerate(range(iy + 16, iy + 40, 8)):
-        d.line([ix + 17, yy, ix + 45, yy], fill=(120, 120, 120), width=2)
-    d.ellipse([ix + 36, iy + 38, ix + 52, iy + 54], fill=RED, outline=(255, 255, 255))
-    d.line([ix + 8, iy + 52, ix + 30, iy + 30], fill=BLUE, width=3)
+def draw_panel(draw, x, y, w, h, story):
+    draw.text((x + 22, y + 14), story["kicker"], font=load(SANS_BOLD, 22), fill=story["color"])
+    ICONS[story["icon"]](draw, x + w - 86, y + 12)
+    head_f, head_lines = fit_wrap(draw, story["headline"], SERIF_BOLD, 28, w - 44 - 84, 2, min_size=22)
+    hy = y + 46
+    for line in head_lines:
+        draw.text((x + 22, hy), line, font=head_f, fill=INK)
+        hy += head_f.size + 6
+    sum_f = load(SANS, 19)
+    sy = hy + 6
+    for line in wrap(draw, story["summary"], sum_f, w - 44)[:3]:
+        draw.text((x + 22, sy), line, font=sum_f, fill=INK)
+        sy += 25
 
 
-def icon_store(ix, iy):
-    d.rectangle([ix, iy, ix + 62, iy + 62], outline=INK, width=2, fill=(239, 232, 216))
-    d.rectangle([ix + 10, iy + 22, ix + 52, iy + 54], fill=(200, 210, 225), outline=INK)
-    for j in range(4):
-        x = ix + 10 + j * 11
-        d.rectangle([x, iy + 12, x + 11, iy + 22], fill=RED if j % 2 == 0 else (255, 255, 255),
-                    outline=INK)
-    d.rectangle([ix + 26, iy + 38, ix + 36, iy + 54], fill=INK)
-    d.ellipse([ix + 40, iy + 6, ix + 58, iy + 24], fill=GOLD, outline=INK)
-    d.text((ix + 49, iy + 15), "*", font=SANS_B(18), fill=INK, anchor="mm")
+def draw_strip(draw, y, h):
+    draw.rectangle([0, y, W, y + h], fill=NAVY_DEEP)
+    draw.text((24, y + 12), "ALSO:", font=load(SANS_BOLD, 22), fill=GOLD)
+    line_f = load(SANS, 20)
+    ly = y + 12
+    for line in STRIP:
+        draw.text((120, ly), line, font=line_f, fill=WHITE)
+        ly += 24
 
 
-def icon_coins(ix, iy):
-    d.rectangle([ix, iy, ix + 62, iy + 62], outline=INK, width=2, fill=(239, 232, 216))
-    for j, yy in enumerate([iy + 42, iy + 32, iy + 22]):
-        d.ellipse([ix + 12, yy, ix + 34, yy + 12], fill=GOLD, outline=INK)
-        d.text((ix + 23, yy + 6), "$", font=SANS_B(11), fill=INK, anchor="mm")
-    d.line([ix + 44, iy + 48, ix + 44, iy + 16], fill=GREEN, width=4)
-    d.polygon([(ix + 36, iy + 22), (ix + 44, iy + 10), (ix + 52, iy + 22)], fill=GREEN)
+def build():
+    img = Image.new("RGB", (W, H), PAPER)
+    draw = ImageDraw.Draw(img)
+    draw_masthead(draw)
+    draw_lead(draw, 0, 161, W, 246)
+    draw.line([0, 407, W, 407], fill=INK, width=3)
+    draw_panel(draw, 0, 410, 512, 244, PANELS[0])
+    draw_panel(draw, 512, 410, 512, 244, PANELS[1])
+    draw_panel(draw, 0, 654, 512, 244, PANELS[2])
+    draw_panel(draw, 512, 654, 512, 244, PANELS[3])
+    draw.line([512, 410, 512, 898], fill=INK, width=3)
+    draw.line([0, 654, W, 654], fill=INK, width=3)
+    draw_strip(draw, 898, 86)
+    draw.rectangle([0, 984, W, H], fill=INK)
+    draw.text((24, 1000), FOOTER, font=load(SANS, 16), fill=MUTED)
+    draw.rectangle([0, 0, W - 1, H - 1], outline=INK, width=5)
+    return img
 
 
-def icon_mine(ix, iy):
-    d.rectangle([ix, iy, ix + 62, iy + 62], outline=INK, width=2, fill=(239, 232, 216))
-    d.pieslice([ix + 14, iy + 14, ix + 48, iy + 56], 180, 360, fill=(60, 60, 60))
-    d.rectangle([ix + 14, iy + 40, ix + 48, iy + 56], fill=(60, 60, 60))
-    d.arc([ix + 22, iy + 30, ix + 40, iy + 48], 180, 360, fill=GOLD, width=3)
-    d.ellipse([ix + 29, iy + 26, ix + 33, iy + 30], fill=GOLD)
-    for wx in range(ix + 6, ix + 56, 10):
-        d.arc([wx, iy + 50, wx + 10, iy + 60], 0, 180, fill=BLUE, width=2)
+def main(argv):
+    if len(argv) > 1:
+        out = argv[1]
+    else:
+        here = os.path.dirname(os.path.abspath(__file__))
+        out = os.path.normpath(os.path.join(here, "..", "entry", "entry.png"))
+    img = build()
+    if img.size != (W, H):
+        raise SystemExit(f"bad size {img.size}")
+    img.save(out, format="PNG")
+    with open(out, "rb") as fh:
+        data = fh.read()
+    print(f"wrote {out} {len(data)} bytes sha256={hashlib.sha256(data).hexdigest()}")
+    return 0
 
 
-R2Y0, R2Y1 = 404, 612
-R3Y0, R3Y1 = 624, 832
-small_panel(8, 505, R2Y0, R2Y1, BLUE, "PACIFIC",
-            ["SOLOMONS PICK AUSTRALIA", "IN HISTORIC TREATY"],
-            "Albanese and Wale sign in Canberra; Solomons rule out any "
-            "foreign military base on their soil.",
-            icon_treaty)
-small_panel(519, 1016, R2Y0, R2Y1, RED, "COLOMBIA",
-            ["ALL HOSTAGES FREED", "IN CARTAGENA RAID"],
-            "Troops storm supermarket after day-long siege; one gunman "
-            "killed, four detained.",
-            icon_store)
-small_panel(8, 505, R3Y0, R3Y1, GREEN, "BANGLADESH",
-            ["GARMENT PAY UP 36%", "AFTER PROTESTS"],
-            "Minimum wage rises to Tk17,000 a month from Tk12,500; board "
-            "votes 4-2 after weeks of strikes.",
-            icon_coins)
-small_panel(519, 1016, R3Y0, R3Y1, BLUE, "INDONESIA",
-            ["3 DEAD, 23 STILL TRAPPED", "IN FLOODED MINE"],
-            "Rescuers pump water from 100m shaft at illegal gold mine in "
-            "Bogor; 11 miners escaped Monday.",
-            icon_mine)
-
-# ---- bottom strip -----------------------------------------------------------
-SY0, SY1 = 844, 1008
-d.rectangle([8, SY0, 1016, SY1], fill=NAVY)
-strip = [
-    "North Korea expels Swiss envoy \u2014 48 hours to leave.",
-    "Houthis advance on Aden as residents prepare to flee.",
-    "Nikkei falls 2.8% as AI doubts hit tech shares.",
-]
-sy = SY0 + 16
-d.text((24, sy), "ALSO:", font=SANS_B(24), fill=GOLD)
-sx = 24 + text_w("ALSO:  ", SANS_B(24))
-for ln in strip:
-    d.text((sx, sy), ln, font=SANS(23), fill=(255, 255, 255))
-    sy += 32
-d.text((24, SY1 - 30), "WORLD NEWS  \u00b7  25 NOVEMBER 2026",
-       font=SANS_B(16), fill=(150, 170, 200))
-
-out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "out", "entry.png")
-os.makedirs(os.path.dirname(out), exist_ok=True)
-img.save(out, optimize=True)
-print("saved", out, os.path.getsize(out), "bytes")
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
